@@ -1,0 +1,5 @@
+# actionlint's built-in runner list (1.7.12) predates ubuntu-26.04, which GitHub
+# already serves; declare it so the label is not reported as unknown.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

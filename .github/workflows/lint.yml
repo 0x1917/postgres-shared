@@ -1,0 +1,86 @@
+# Static checks that need no image: workflow schema (actionlint, which also
+# lints the shell inside `run:` blocks), the shell scripts (shellcheck), the
+# tag-ordering tests the publish workflow depends on, and, in a repository
+# created from the template, that no template placeholder is left.
+#
+# One job, one check context (`lint`), independent verdicts: each check runs to
+# completion and the last step reports all of them before failing the job.
+
+name: lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: actionlint
+        id: actionlint
+        continue-on-error: true
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12
+
+      - name: shellcheck
+        id: shellcheck
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          shellcheck --version >/dev/null || { echo "shellcheck not on the runner" >&2; exit 1; }
+          shellcheck -x -S warning runtime/*.sh scripts/*.sh
+
+      - name: build inputs cover the Dockerfile
+        id: inputs
+        continue-on-error: true
+        run: bash scripts/check-build-inputs.sh
+
+      - name: tag ordering tests
+        id: tags
+        continue-on-error: true
+        run: node --test scripts/tags.test.mjs
+
+      - name: template placeholders
+        id: placeholders
+        if: github.repository != '0x1917/docker-template'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if git grep -nE '__(APP|TITLE|REPO|UPSTREAM|PORT)__' -- . ':(exclude)scripts/init.sh'; then
+            echo "::error::template placeholders left; run scripts/init.sh"
+            exit 1
+          fi
+          git grep -n 'TODO(template)' -- . ':(exclude).github/workflows/lint.yml' | sed 's/^/::warning::/' || true
+
+      - name: Verdict
+        if: always()
+        env:
+          ACTIONLINT: ${{ steps.actionlint.outcome }}
+          SHELLCHECK: ${{ steps.shellcheck.outcome }}
+          TAGS: ${{ steps.tags.outcome }}
+          INPUTS: ${{ steps.inputs.outcome }}
+          PLACEHOLDERS: ${{ steps.placeholders.outcome }}
+        run: |
+          set -uo pipefail
+          echo "actionlint: $ACTIONLINT"
+          echo "shellcheck: $SHELLCHECK"
+          echo "tags:       $TAGS"
+          echo "inputs:     $INPUTS"
+          echo "placeholders: $PLACEHOLDERS"
+          rc=0
+          [ "$ACTIONLINT" = "success" ] || { echo "::error::actionlint failed"; rc=1; }
+          [ "$SHELLCHECK" = "success" ] || { echo "::error::shellcheck failed"; rc=1; }
+          [ "$TAGS" = "success" ] || { echo "::error::tag ordering tests failed"; rc=1; }
+          [ "$INPUTS" = "success" ] || { echo "::error::the Dockerfile copies a path .github/build-inputs does not list"; rc=1; }
+          case "$PLACEHOLDERS" in success|skipped) ;; *) echo "::error::template placeholders left"; rc=1 ;; esac
+          exit "$rc"

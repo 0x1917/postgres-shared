@@ -1,0 +1,188 @@
+# Build and smoke-test the __APP__ image.
+#
+# This workflow NEVER writes to the registry. When the change set touches a
+# build input it exports the tested image as a compressed tarball artifact plus
+# a small metadata file, and `publish.yml` picks that up via `workflow_run`.
+# Secrets stay in the publish workflow.
+#
+# Version comes from `ARG UPSTREAM_VERSION` in the Dockerfile, which Renovate
+# bumps (renovate.json5).
+
+name: build
+
+on:
+  # Every push builds, on any branch and any path. What publishes is decided by
+  # the scope step, which requires master AND a diff in the build inputs.
+  push:
+  # Every PR runs the build, no path filter, so the "build" check always reports.
+  pull_request:
+  # Weekly canary: a broken upstream release, base image or apt mirror shows up
+  # as a red run instead of waiting for the next bump. Never publishes.
+  schedule:
+    - cron: "0 5 * * 1"
+  # Manual run. `force_publish=true` marks the build publishable even though
+  # nothing changed (a dispatch is never diffed); that is how a rebuild on a
+  # fresh base image ships as `-r<n>`.
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Force publish image"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write      # upload the image artifact for the publish workflow
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARTIFACT: __APP__-image
+  RETENTION: 3
+
+jobs:
+  build:
+    # The check context equals this name. A ruleset that requires "build"
+    # silently disarms if it changes.
+    name: build
+    # The template repository itself has no app to build; repositories created from
+    # it do. (A derived repository keeps this guard harmlessly.)
+    if: github.repository != '0x1917/docker-template'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # the scope check diffs the last published tag against HEAD
+
+      # Only the paths that reach the image count: .github/build-inputs lists
+      # them, and lint fails if the Dockerfile copies from anywhere else, so a
+      # new COPY source cannot change the image without publishing it.
+      #
+      # The baseline is the highest source tag, i.e. what last shipped, not
+      # github.event.before: after a force-push that sha is orphaned and absent
+      # from the clone, and a push that only amends a README commit must not
+      # republish. A failed publish leaves no tag, so the next push retries it.
+      # Tags are ordered by semver (scripts/tags.mjs): sort -V misorders
+      # prereleases.
+      - name: Determine if image was updated
+        id: scope
+        if: github.event_name != 'pull_request'
+        env:
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force_publish }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ "$FORCE" = "true" ]; then
+              echo "forced by the dispatch input, packaging for publish"
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              echo "forced=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "dispatch without force_publish, so build and smoke only"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+          if [ "$EVENT" = "schedule" ]; then
+            echo "scheduled run, so build and smoke only"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/master" ]; then
+            echo "not master, so build and smoke only"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST=$(git tag -l 'v*' | node scripts/tags.mjs max)
+          INPUTS=()
+          while IFS= read -r p; do INPUTS+=("$p"); done < <(grep -vE '^[[:space:]]*(#|$)' .github/build-inputs)
+          if [ -z "$LAST" ] || ! git diff --quiet "$LAST" "$GITHUB_SHA" -- "${INPUTS[@]}"; then
+            echo "build inputs changed since ${LAST:-no release tag yet}, packaging for publish"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no build input changed, so build and smoke only"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve version from the Dockerfile
+        id: meta
+        run: |
+          set -euo pipefail
+          V=$(sed -n 's/^ARG UPSTREAM_VERSION=//p' Dockerfile | head -1)
+          case "$V" in
+            ""|*[!0-9A-Za-z.-]*) echo "unreadable ARG UPSTREAM_VERSION: '$V'" >&2; exit 1 ;;
+          esac
+          # build_date is git-formatted (%cI), so it is always well-formed; commit
+          # metadata is never interpolated into `with:` blocks directly.
+          {
+            echo "version=$V"
+            echo "build_date=$(git log -1 --format=%cI)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Feeds the base.name and base.digest labels from the FROM line, so they
+      # follow it when Renovate moves the base image. The FROM line itself is
+      # what gets built.
+      - name: Resolve the base image
+        id: digest
+        run: |
+          set -euo pipefail
+          BASE=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' Dockerfile | tail -1)
+          {
+            echo "base_name=${BASE%%@*}"
+            echo "base_digest=$(docker buildx imagetools inspect "$BASE" --format '{{.Manifest.Digest}}')"
+          } >> "$GITHUB_OUTPUT"
+
+      # The registry is private, so there is no anonymous registry cache to read:
+      # the Actions cache carries layers between runs.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: __APP__:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            BASE_NAME=${{ steps.digest.outputs.base_name }}
+            BASE_DIGEST=${{ steps.digest.outputs.base_digest }}
+
+      - name: Run smoke test
+        run: bash scripts/smoke-test.sh __APP__:test
+
+      - name: Write the bundle manifest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PUBLISH: ${{ steps.scope.outputs.publish }}
+          FORCED: ${{ steps.scope.outputs.forced || 'false' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bundle"
+          ID=$(docker image inspect --format '{{.Id}}' __APP__:test)
+          jq -n --arg v "$VERSION" --arg id "$ID" --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+                --argjson pub "${PUBLISH:-false}" --argjson forced "$FORCED"                       \
+                '{version:$v, image_id:$id, commit:$sha, build_run:$run, publish:$pub, forced:$forced}' \
+                > "$RUNNER_TEMP/bundle/meta.json"
+          cat "$RUNNER_TEMP/bundle/meta.json"
+
+      # Hand the EXACT image that passed the gate to the publish workflow. The
+      # image ID in meta.json lets the publish side prove it loaded these bytes.
+      - name: Package the tested image
+        if: steps.scope.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          docker save __APP__:test | zstd -T0 -3 -q -o "$RUNNER_TEMP/bundle/image.tar.zst"
+          ls -lh "$RUNNER_TEMP/bundle"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ runner.temp }}/bundle
+          retention-days: ${{ env.RETENTION }}
+          compression-level: 0   # the tarball is already zstd

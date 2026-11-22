@@ -1,0 +1,6 @@
+.git
+.github
+*.md
+scripts
+renovate.json5
+LICENSE

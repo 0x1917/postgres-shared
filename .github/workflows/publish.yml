@@ -1,0 +1,424 @@
+# Publish the image that `build.yml` built and smoke-tested.
+#
+# Chained with `workflow_run`: it fires when the build workflow completes,
+# downloads that exact run's artifact, proves the loaded image is the tested one
+# (image ID from meta.json, plus the smoke gate run again on the loaded bytes),
+# and only then pushes to Docker Hub, tags the source, and cuts the GitHub
+# release, then copies the image to ghcr.io (best effort). Nothing here can
+# build.
+#
+# The scripts this workflow runs (the smoke test, scripts/tags.mjs) come from
+# the default branch, never from the build run's commit: this job holds a
+# write token, so it executes only code already on master. The build run's
+# commit is used as data alone, as the target of the source tag.
+#
+# Tags: the first publish of an upstream version gets the bare version
+# (v1.2.3 in git, 1.2.3 on the registry); a rebuild of it gets -r<n>. `latest` moves only when this run carries the highest tag of the whole
+# series, ordered by semver (scripts/tags.mjs).
+#
+# The release body quotes the notes of upstream's GitHub release for the tag
+# UPSTREAM_TAG_PREFIX<version>, if there is one.
+#
+# Secrets (Repo Settings > Secrets and Variables > Actions):
+#   DOCKERHUB_TOKEN     Docker Hub access token with Read & Write scope
+
+name: publish
+
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+  # Manual re-publish of a specific build run: pass its run id.
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "The build run ID to publish: Open Actions > Build > Click on the run > Extract the ID from the URL."
+        required: true
+        type: string
+
+permissions:
+  contents: write   # push the source tag and create the release
+  actions: read     # download the artifact from the triggering run
+  packages: write   # best-effort copy to ghcr.io
+
+# Serialised: `latest` must never be raced, and the -r<n> series assumes one writer.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  # Quoted: unquoted, YAML reads 0x1917 as the hex number 6423.
+  NAMESPACE: "0x1917"
+  IMAGE: 0x1917/__APP__
+  GHCR: ghcr.io/0x1917/__APP__
+  ARTIFACT: __APP__-image
+  UPSTREAM: __UPSTREAM__
+  UPSTREAM_TAG_PREFIX: v
+
+jobs:
+  publish:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'master' &&
+       (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch'))
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.build_run_id }}
+    steps:
+      # The commit to tag is the BUILD RUN's head. Validate the run itself: a
+      # dispatch can name any run id, including a fork PR's build, whose code
+      # would then run here with a write token. Only master pushes/dispatches pass.
+      - name: Resolve and validate the target commit
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          case "$RUN_ID" in
+            *[!0-9]*|"") echo "not a run id: $RUN_ID" >&2; exit 1 ;;
+          esac
+          RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")
+          BRANCH=$(printf '%s' "$RUN" | jq -r .head_branch)
+          EVENT=$(printf '%s' "$RUN" | jq -r .event)
+          SHA=$(printf '%s' "$RUN" | jq -r .head_sha)
+          case "$EVENT" in
+            push|workflow_dispatch) ;;
+            *) echo "build run $RUN_ID came from '$EVENT', refusing" >&2; exit 1 ;;
+          esac
+          [ "$BRANCH" = "master" ] || { echo "build run $RUN_ID is on '$BRANCH', not master" >&2; exit 1; }
+          [ -z "$WR_SHA" ] || [ "$WR_SHA" = "$SHA" ] || { echo "payload sha disagrees with the run" >&2; exit 1; }
+          case "$SHA" in
+            *[!0-9a-f]*|"") echo "not a commit sha: $SHA" >&2; exit 1 ;;
+          esac
+          [ "${#SHA}" -eq 40 ] || { echo "not a commit sha: $SHA" >&2; exit 1; }
+          echo "publishing build run $RUN_ID ($SHA) from $EVENT on $BRANCH"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.ARTIFACT }}
+          # Outside the checkout: actions/checkout cleans the working tree.
+          path: ${{ runner.temp }}/bundle
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read the bundle manifest
+        id: meta
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/bundle"
+          test -s "$BUNDLE/meta.json" || { echo "no meta.json in the artifact" >&2; exit 1; }
+          cat "$BUNDLE/meta.json"
+          {
+            echo "version=$(jq -r .version "$BUNDLE/meta.json")"
+            echo "image_id=$(jq -r .image_id "$BUNDLE/meta.json")"
+            echo "publish=$(jq -r .publish "$BUNDLE/meta.json")"
+            echo "forced=$(jq -r '.forced // false' "$BUNDLE/meta.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Nothing to publish
+        if: steps.meta.outputs.publish != 'true'
+        run: echo "that build was not marked for publishing, so this run stops here"
+
+      # The default branch, not the build run's commit (see the header).
+      # fetch-depth 0 brings the target commit and the remote's tags along.
+      - uses: actions/checkout@v7
+        if: steps.meta.outputs.publish == 'true'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm the target commit is on master
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$SHA" HEAD \
+            || { echo "build run commit $SHA is not on master (force-pushed away?), refusing to tag it" >&2; exit 1; }
+
+      # Re-checked here, not only in build: build decides before an earlier publish
+      # has created its tag, so two pushes in quick succession both compare against
+      # the old baseline and the second republishes an unchanged image as -r<n>.
+      # Publish runs are serialised, so by now the highest tag is current. A forced
+      # build (a base image rebuild) and a manual re-publish of a named build run
+      # skip the check: both are explicit requests to push.
+      - name: Confirm the image changed since the last release
+        id: recheck
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+          FORCED: ${{ steps.meta.outputs.forced }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          LAST=$(git tag -l 'v*' | node scripts/tags.mjs max)
+          INPUTS=()
+          while IFS= read -r p; do INPUTS+=("$p"); done < <(grep -vE '^[[:space:]]*(#|$)' .github/build-inputs)
+          if [ "$FORCED" = true ] || [ "$EVENT" = workflow_dispatch ] || [ -z "$LAST" ] || ! git diff --quiet "$LAST" "$SHA" -- "${INPUTS[@]}"; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no build input changed between $LAST and $SHA (another publish got there first), so nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Load the tested image
+        if: steps.recheck.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/bundle"
+          test -s "$BUNDLE/image.tar.zst" || { echo "artifact has no image tarball" >&2; exit 1; }
+          zstd -dc "$BUNDLE/image.tar.zst" | docker load
+          GOT=$(docker image inspect --format '{{.Id}}' __APP__:test)
+          WANT="${{ steps.meta.outputs.image_id }}"
+          echo "loaded: $GOT"
+          echo "tested: $WANT"
+          [ "$GOT" = "$WANT" ] || { echo "the loaded image is not the image that was tested" >&2; exit 1; }
+
+      # The bytes travelled through an artifact store, so the gate runs again on
+      # what actually arrived rather than trusting the build run's log.
+      - name: Run the smoke test on the loaded image
+        if: steps.recheck.outputs.publish == 'true'
+        run: bash scripts/smoke-test.sh __APP__:test
+
+      # Computed from read-only git state BEFORE anything is pushed.
+      - name: Resolve the publish tag
+        id: pubtag
+        if: steps.recheck.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          BASE="v${VERSION}"
+          TAG=$(git tag --points-at "$SHA" | node scripts/tags.mjs version "$VERSION")
+          # A tag on this commit is only this run's when its note names this
+          # build run; a new build of a published commit is a rebuild.
+          if [ -n "$TAG" ] && ! git tag -l --format='%(contents)' "$TAG" | grep -Fq "build run $RUN_ID)"; then
+            echo "$TAG on this commit came from another build run, numbering a rebuild"
+            TAG=""
+          fi
+          if [ -n "$TAG" ]; then
+            NOTE="Source state published as $IMAGE:${TAG#v} (build run $RUN_ID)"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$BASE" >/dev/null 2>&1; then
+            N=$(git ls-remote --tags origin | awk -v p="refs/tags/${BASE}-r" \
+                  'index($2, p) == 1 { n = substr($2, length(p) + 1); if (n ~ /^[0-9]+$/) print n }' \
+                  | sort -n | tail -1)
+            N=${N:-0}
+            TAG="${BASE}-r$((N + 1))"
+            NOTE="Rebuild #$((N + 1)) of $IMAGE:$VERSION (release tag already exists, build run $RUN_ID)"
+          else
+            TAG="$BASE"
+            NOTE="Source state published as $IMAGE:$VERSION (build run $RUN_ID)"
+          fi
+          # The new tag is not on the remote yet, so it joins the candidates.
+          HIGHEST_ALL=$({ git ls-remote --tags origin | awk '{sub(/^refs\/tags\//,"",$2); print $2}'; echo "$TAG"; } \
+            | node scripts/tags.mjs max)
+          if [ "$TAG" = "$HIGHEST_ALL" ]; then PUSH_LATEST=true; else PUSH_LATEST=false; fi
+          {
+            echo "tag=$TAG"
+            echo "registry_tag=${TAG#v}"
+            echo "note=$NOTE"
+            echo "push_latest=$PUSH_LATEST"
+          } >> "$GITHUB_OUTPUT"
+          echo "publish tag: $TAG (registry tag: ${TAG#v}, push_latest=$PUSH_LATEST)"
+
+      - name: Log in to Docker Hub
+        if: steps.recheck.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ env.NAMESPACE }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag and push the image
+        if: steps.recheck.outputs.publish == 'true'
+        env:
+          REGISTRY_TAG: ${{ steps.pubtag.outputs.registry_tag }}
+          PUSH_LATEST: ${{ steps.pubtag.outputs.push_latest }}
+        run: |
+          set -euo pipefail
+          docker tag __APP__:test "$IMAGE:$REGISTRY_TAG"
+          docker push "$IMAGE:$REGISTRY_TAG"
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker tag __APP__:test "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          else
+            echo "not the highest tag of the series, so latest is left alone"
+          fi
+
+      - name: Verify the pushed digest
+        id: digests
+        if: steps.recheck.outputs.publish == 'true'
+        env:
+          REGISTRY_TAG: ${{ steps.pubtag.outputs.registry_tag }}
+          PUSH_LATEST: ${{ steps.pubtag.outputs.push_latest }}
+        run: |
+          set -euo pipefail
+          v=$(docker buildx imagetools inspect "$IMAGE:$REGISTRY_TAG" --format '{{.Manifest.Digest}}')
+          echo "version: $v"
+          if [ "$PUSH_LATEST" = "true" ]; then
+            l=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')
+            echo "latest:  $l"
+            [ "$v" = "$l" ]
+          fi
+          echo "digest=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Create the source tag
+        id: tag
+        if: steps.recheck.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.pubtag.outputs.tag }}
+          NOTE: ${{ steps.pubtag.outputs.note }}
+          SHA: ${{ steps.target.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Checkout kept no credentials; the push authenticates here, after the
+          # image is already published.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git tag --points-at "$SHA" | grep -Fxq "$TAG"; then
+            echo "this commit already carries $TAG, nothing to tag"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$NOTE" "$SHA"
+          git push origin "refs/tags/$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # ---- best-effort mirror to GHCR ----------------------------------
+      # Everything below runs after the Hub push, the digest check and the git
+      # tag, so a failure here cannot corrupt the release record. Each step is
+      # continue-on-error and the last one reports the combined outcome as a
+      # warning annotation instead of a red run.
+      - name: Log in to GHCR
+        id: ghcr_login
+        if: steps.recheck.outputs.publish == 'true'
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the GHCR copy
+        id: ghcr_push
+        if: steps.recheck.outputs.publish == 'true'
+        continue-on-error: true
+        env:
+          REGISTRY_TAG: ${{ steps.pubtag.outputs.registry_tag }}
+          PUSH_LATEST: ${{ steps.pubtag.outputs.push_latest }}
+        run: |
+          set -euo pipefail
+          docker tag __APP__:test "$GHCR:$REGISTRY_TAG"
+          docker push "$GHCR:$REGISTRY_TAG"
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker tag __APP__:test "$GHCR:latest"
+            docker push "$GHCR:latest"
+          else
+            echo "not the highest tag of the series, so ghcr latest is left alone"
+          fi
+
+      # Both registries store the same manifest bytes, so the digest is the
+      # same content-addressed value on each: compare the GHCR copy against the
+      # Hub tag too. A mismatch means the mirror is not carrying the published
+      # image. The `latest` pair is compared only when this run moved it.
+      - name: Verify the GHCR tags
+        id: ghcr_verify
+        if: steps.recheck.outputs.publish == 'true'
+        continue-on-error: true
+        env:
+          REGISTRY_TAG: ${{ steps.pubtag.outputs.registry_tag }}
+          PUSH_LATEST: ${{ steps.pubtag.outputs.push_latest }}
+        run: |
+          set -euo pipefail
+          v=$(docker buildx imagetools inspect "$GHCR:$REGISTRY_TAG" --format '{{.Manifest.Digest}}')
+          h=$(docker buildx imagetools inspect "$IMAGE:$REGISTRY_TAG" --format '{{.Manifest.Digest}}')
+          echo "ghcr version: $v"
+          echo "hub  version: $h"
+          [ "$v" = "$h" ]
+          if [ "$PUSH_LATEST" = "true" ]; then
+            l=$(docker buildx imagetools inspect "$GHCR:latest" --format '{{.Manifest.Digest}}')
+            echo "ghcr latest:  $l"
+            [ "$v" = "$l" ]
+          else
+            echo "ghcr latest:  not moved by this run"
+          fi
+
+      - name: GHCR outcome
+        if: always() && steps.recheck.outputs.publish == 'true'
+        env:
+          LOGIN: ${{ steps.ghcr_login.outcome }}
+          PUSH: ${{ steps.ghcr_push.outcome }}
+          VERIFY: ${{ steps.ghcr_verify.outcome }}
+        run: |
+          set -uo pipefail
+          echo "ghcr login: $LOGIN, push: $PUSH, verify: $VERIFY"
+          if [ "$LOGIN" != "success" ] || [ "$PUSH" != "success" ] || [ "$VERIFY" != "success" ]; then
+            echo "::warning::GHCR mirror incomplete (login=$LOGIN push=$PUSH verify=$VERIFY); Docker Hub published, treat ${GHCR:-ghcr.io} as unavailable"
+          fi
+
+      # Last on purpose: everything it states has already happened.
+      - name: Create or update the GitHub release
+        if: success() && steps.recheck.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          DIGEST: ${{ steps.digests.outputs.digest }}
+          SHA: ${{ steps.target.outputs.sha }}
+          BUILD_RUN: ${{ env.RUN_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The single-quoted backticks in this step are markdown code spans, not
+          # command substitutions, hence the SC2016 disables.
+          set -euo pipefail
+          [ -n "${TAG:-}" ] || { echo "no source tag resolved for v$VERSION, refusing to guess" >&2; exit 1; }
+          UP_TAG="${UPSTREAM_TAG_PREFIX}${VERSION}"
+          NOTES="$RUNNER_TEMP/upstream-notes.md"
+
+          # Upstream's notes credit contributors with @handles; quoting them raw
+          # would mention those people from this repo, so they become code spans.
+          # shellcheck disable=SC2016
+          gh api "repos/$UPSTREAM/releases/tags/$UP_TAG" --jq .body 2>/dev/null \
+            | sed -E 's/(^|[^`A-Za-z0-9_])@([A-Za-z0-9][A-Za-z0-9-]*)/\1`@\2`/g' > "$NOTES" || : > "$NOTES"
+          # shellcheck disable=SC2016
+          [ -s "$NOTES" ] || printf '_Upstream published no notes for `%s`._\n' "$UP_TAG" > "$NOTES"
+
+          BODY="$RUNNER_TEMP/release.md"
+          # shellcheck disable=SC2016
+          {
+            printf 'Container image for __TITLE__ %s, built from upstream [%s](https://github.com/%s/releases/tag/%s). Published to Docker Hub as `%s:%s`, with a best-effort mirror on [GHCR](%s).\n\n' \
+              "$VERSION" "$UP_TAG" "$UPSTREAM" "$UP_TAG" "$IMAGE" "${TAG#v}" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pkgs/container/${GHCR##*/}"
+            printf '| Digest | Tag commit | Build run |\n| --- | --- | --- |\n'
+            printf "| \`%s\` | %s | [%s](%s/%s/actions/runs/%s) |\n\n" \
+              "${DIGEST:-unknown}" "$SHA" "$BUILD_RUN" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$BUILD_RUN"
+            printf 'The notes below are from upstream %s, quoted as published.\n\n---\n\n' "$UP_TAG"
+            cat "$NOTES"
+          } > "$BODY"
+
+          # A prerelease upstream version makes a prerelease here, never marked latest.
+          FLAGS=(--latest)
+          case "$VERSION" in *-*) FLAGS=(--prerelease --latest=false) ;; esac
+
+          # One release per upstream version, pointing at its HIGHEST source tag.
+          HIGHEST=$(git ls-remote --tags origin | awk '{sub(/^refs\/tags\//,"",$2); print $2}' \
+            | node scripts/tags.mjs version "$VERSION")
+          [ -n "$HIGHEST" ] || HIGHEST="$TAG"
+          if [ "$TAG" != "$HIGHEST" ]; then
+            echo "re-published $TAG, older than $HIGHEST: the release stays as it is"
+            exit 0
+          fi
+          EXISTING=$(gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | node scripts/tags.mjs version "$VERSION")
+          if [ -n "$EXISTING" ]; then
+            gh release edit "$EXISTING" --tag "$HIGHEST" --verify-tag --title "v$VERSION" --notes-file "$BODY" "${FLAGS[@]}"
+            echo "release retargeted: $EXISTING -> $HIGHEST"
+          else
+            gh release create "$HIGHEST" --title "v$VERSION" --notes-file "$BODY" --verify-tag "${FLAGS[@]}"
+            echo "created the release on $HIGHEST"
+          fi

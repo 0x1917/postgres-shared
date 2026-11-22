@@ -1,0 +1,58 @@
+// Renovate: the upstream watcher for this image.
+//
+// A Renovate app PR triggers workflows, so the `build` (with its smoke test) and `lint`
+// checks run on every bump before it can be merged. Merging a bump to master then
+// builds and publishes through build.yml -> publish.yml.
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['config:recommended'],
+  labels: ['dependencies'],
+  // No standing Dependency Dashboard issue: pending updates arrive as PRs.
+  dependencyDashboard: { enabled: false },
+  customManagers: [
+    {
+      // The upstream release, pinned by ARG UPSTREAM_VERSION in the Dockerfile.
+      // Pick the source that matches how upstream publishes:
+      //   GitHub releases:  datasource github-releases, depName owner/repo (below)
+      //   git tags only:    datasource github-tags, plus extractVersionTemplate
+      //                     '^v(?<version>.+)$' for a tag prefix
+      //   npm package:      datasource npm, depName the package name
+      //   container image:  datasource docker, depName the image
+      customType: 'regex',
+      description: '__TITLE__ release pinned by ARG UPSTREAM_VERSION',
+      managerFilePatterns: ['/(^|/)Dockerfile$/'],
+      matchStrings: ['ARG UPSTREAM_VERSION=(?<currentValue>\\S+)'],
+      depNameTemplate: '__UPSTREAM__',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^v?(?<version>.+)$',
+      versioningTemplate: 'semver',
+    },
+  ],
+  packageRules: [
+    {
+      matchDepNames: ['__UPSTREAM__'],
+      commitMessageTopic: '__TITLE__',
+      labels: ['dependencies', 'upstream'],
+      // For an upstream that only ships prereleases, also set
+      //   ignoreUnstable: false, allowedVersions: '!/-alpha\\./'
+    },
+    {
+      // Pin the base image by digest so its fixes (Debian security updates) arrive
+      // as PRs. Merging one republishes the same upstream version as a -r<n>
+      // rebuild. Batched weekly to limit churn.
+      matchDatasources: ['docker'],
+      pinDigests: true,
+    },
+    {
+      matchDatasources: ['docker'],
+      matchUpdateTypes: ['digest', 'pinDigest'],
+      schedule: ['before 6am on monday'],
+    },
+    {
+      // Actions pin by major tag; minor and patch land as one PR, majors stay separate.
+      matchManagers: ['github-actions'],
+      matchUpdateTypes: ['minor', 'patch', 'digest'],
+      groupName: 'github-actions',
+    },
+  ],
+}
