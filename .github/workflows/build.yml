@@ -1,4 +1,4 @@
-# Build and smoke-test the __APP__ image.
+# Build and smoke-test the postgres-shared image.
 #
 # This workflow NEVER writes to the registry. When the change set touches a
 # build input it exports the tested image as a compressed tarball artifact plus
@@ -39,7 +39,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ARTIFACT: __APP__-image
+  ARTIFACT: postgres-shared-image
   RETENTION: 3
 
 jobs:
@@ -144,7 +144,7 @@ jobs:
         with:
           context: .
           load: true
-          tags: __APP__:test
+          tags: postgres-shared:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -154,7 +154,7 @@ jobs:
             BASE_DIGEST=${{ steps.digest.outputs.base_digest }}
 
       - name: Run smoke test
-        run: bash scripts/smoke-test.sh __APP__:test
+        run: bash scripts/smoke-test.sh postgres-shared:test
 
       - name: Write the bundle manifest
         env:
@@ -164,7 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bundle"
-          ID=$(docker image inspect --format '{{.Id}}' __APP__:test)
+          ID=$(docker image inspect --format '{{.Id}}' postgres-shared:test)
           jq -n --arg v "$VERSION" --arg id "$ID" --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
                 --argjson pub "${PUBLISH:-false}" --argjson forced "$FORCED"                       \
                 '{version:$v, image_id:$id, commit:$sha, build_run:$run, publish:$pub, forced:$forced}' \
@@ -177,7 +177,7 @@ jobs:
         if: steps.scope.outputs.publish == 'true'
         run: |
           set -euo pipefail
-          docker save __APP__:test | zstd -T0 -3 -q -o "$RUNNER_TEMP/bundle/image.tar.zst"
+          docker save postgres-shared:test | zstd -T0 -3 -q -o "$RUNNER_TEMP/bundle/image.tar.zst"
           ls -lh "$RUNNER_TEMP/bundle"
 
       - uses: actions/upload-artifact@v7

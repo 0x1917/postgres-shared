@@ -8,9 +8,9 @@ contact_links:
   - name: Unraid template issue (templates repository)
     url: https://github.com/0x1917/unraid-templates/issues
     about: The template, its fields, its defaults, and the artwork are maintained in the templates repository, not here.
-  - name: App bug or app feature (upstream)
-    url: https://github.com/__UPSTREAM__/issues
-    about: Anything inside __TITLE__ itself belongs to the upstream project.
+  - name: PostgreSQL bug (upstream)
+    url: https://www.postgresql.org/account/submitbug/
+    about: A bug in PostgreSQL itself goes to the PostgreSQL project. Extension bugs go to pgvector, VectorChord, PostGIS or pg_cron.
   - name: Image tags on Docker Hub
-    url: https://hub.docker.com/r/0x1917/__APP__/tags
+    url: https://hub.docker.com/r/0x1917/postgres-shared/tags
     about: Every published version, and what :latest points at.

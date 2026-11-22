@@ -11,16 +11,16 @@ assignees: ""
 
 **How the container runs**
 
-- Image and tag: <!-- 0x1917/__APP__:<version> or 0x1917/__APP__:latest -->
+- Image and tag: <!-- 0x1917/postgres-shared:<version> or 0x1917/postgres-shared:latest -->
 - Deployed with: <!-- Unraid template, docker run, or docker compose -->
 - Unraid version, or host distribution, kernel and Docker version:
 - CPU architecture: <!-- this image is built for x86_64 only -->
-- Data path: <!-- new install or an existing /data directory -->
+- Data directory: <!-- new install, or an existing cluster (from which image?) -->
 
 **Settings in use**
 <!-- Fill in the ones you changed. Delete the rest. -->
 
-- PUID / PGID:
+- POSTGRES_* / NUQ_DATABASE / PG_CRON_DATABASE values (no passwords):
 - Reverse proxy in front: <!-- yes/no, and which one -->
 
 **Steps to reproduce**
@@ -47,5 +47,5 @@ separates a packaging regression from an upstream one. -->
 Two kinds of report belong elsewhere, not here:
 - the Unraid template, its fields, its defaults, or the artwork:
   https://github.com/0x1917/unraid-templates/issues
-- a bug inside __TITLE__ itself:
-  https://github.com/__UPSTREAM__/issues -->
+- a bug inside PostgreSQL or one of the extensions: https://www.postgresql.org/account/submitbug/,
+  or the pgvector, VectorChord, PostGIS or pg_cron issue tracker -->

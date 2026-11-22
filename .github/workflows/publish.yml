@@ -16,8 +16,8 @@
 # (v1.2.3 in git, 1.2.3 on the registry); a rebuild of it gets -r<n>. `latest` moves only when this run carries the highest tag of the whole
 # series, ordered by semver (scripts/tags.mjs).
 #
-# The release body quotes the notes of upstream's GitHub release for the tag
-# UPSTREAM_TAG_PREFIX<version>, if there is one.
+# The release body lists the component versions and links PostgreSQL's release notes
+# on postgresql.org (PostgreSQL publishes no GitHub releases).
 #
 # Secrets (Repo Settings > Secrets and Variables > Actions):
 #   DOCKERHUB_TOKEN     Docker Hub access token with Read & Write scope
@@ -49,11 +49,9 @@ concurrency:
 env:
   # Quoted: unquoted, YAML reads 0x1917 as the hex number 6423.
   NAMESPACE: "0x1917"
-  IMAGE: 0x1917/__APP__
-  GHCR: ghcr.io/0x1917/__APP__
-  ARTIFACT: __APP__-image
-  UPSTREAM: __UPSTREAM__
-  UPSTREAM_TAG_PREFIX: v
+  IMAGE: 0x1917/postgres-shared
+  GHCR: ghcr.io/0x1917/postgres-shared
+  ARTIFACT: postgres-shared-image
 
 jobs:
   publish:
@@ -173,7 +171,7 @@ jobs:
           BUNDLE="$RUNNER_TEMP/bundle"
           test -s "$BUNDLE/image.tar.zst" || { echo "artifact has no image tarball" >&2; exit 1; }
           zstd -dc "$BUNDLE/image.tar.zst" | docker load
-          GOT=$(docker image inspect --format '{{.Id}}' __APP__:test)
+          GOT=$(docker image inspect --format '{{.Id}}' postgres-shared:test)
           WANT="${{ steps.meta.outputs.image_id }}"
           echo "loaded: $GOT"
           echo "tested: $WANT"
@@ -183,7 +181,7 @@ jobs:
       # what actually arrived rather than trusting the build run's log.
       - name: Run the smoke test on the loaded image
         if: steps.recheck.outputs.publish == 'true'
-        run: bash scripts/smoke-test.sh __APP__:test
+        run: bash scripts/smoke-test.sh postgres-shared:test
 
       # Computed from read-only git state BEFORE anything is pushed.
       - name: Resolve the publish tag
@@ -241,10 +239,10 @@ jobs:
           PUSH_LATEST: ${{ steps.pubtag.outputs.push_latest }}
         run: |
           set -euo pipefail
-          docker tag __APP__:test "$IMAGE:$REGISTRY_TAG"
+          docker tag postgres-shared:test "$IMAGE:$REGISTRY_TAG"
           docker push "$IMAGE:$REGISTRY_TAG"
           if [ "$PUSH_LATEST" = "true" ]; then
-            docker tag __APP__:test "$IMAGE:latest"
+            docker tag postgres-shared:test "$IMAGE:latest"
             docker push "$IMAGE:latest"
           else
             echo "not the highest tag of the series, so latest is left alone"
@@ -315,10 +313,10 @@ jobs:
           PUSH_LATEST: ${{ steps.pubtag.outputs.push_latest }}
         run: |
           set -euo pipefail
-          docker tag __APP__:test "$GHCR:$REGISTRY_TAG"
+          docker tag postgres-shared:test "$GHCR:$REGISTRY_TAG"
           docker push "$GHCR:$REGISTRY_TAG"
           if [ "$PUSH_LATEST" = "true" ]; then
-            docker tag __APP__:test "$GHCR:latest"
+            docker tag postgres-shared:test "$GHCR:latest"
             docker push "$GHCR:latest"
           else
             echo "not the highest tag of the series, so ghcr latest is left alone"
@@ -378,27 +376,25 @@ jobs:
           # command substitutions, hence the SC2016 disables.
           set -euo pipefail
           [ -n "${TAG:-}" ] || { echo "no source tag resolved for v$VERSION, refusing to guess" >&2; exit 1; }
-          UP_TAG="${UPSTREAM_TAG_PREFIX}${VERSION}"
-          NOTES="$RUNNER_TEMP/upstream-notes.md"
-
-          # Upstream's notes credit contributors with @handles; quoting them raw
-          # would mention those people from this repo, so they become code spans.
-          # shellcheck disable=SC2016
-          gh api "repos/$UPSTREAM/releases/tags/$UP_TAG" --jq .body 2>/dev/null \
-            | sed -E 's/(^|[^`A-Za-z0-9_])@([A-Za-z0-9][A-Za-z0-9-]*)/\1`@\2`/g' > "$NOTES" || : > "$NOTES"
-          # shellcheck disable=SC2016
-          [ -s "$NOTES" ] || printf '_Upstream published no notes for `%s`._\n' "$UP_TAG" > "$NOTES"
+          # PostgreSQL publishes no GitHub releases; its notes live on postgresql.org. The
+          # extension versions come from the tagged commit's Dockerfile, so the release says
+          # exactly what the image carries.
+          pin() { git show "$SHA:Dockerfile" | sed -n "s/^ARG $1=//p" | head -1; }
 
           BODY="$RUNNER_TEMP/release.md"
           # shellcheck disable=SC2016
           {
-            printf 'Container image for __TITLE__ %s, built from upstream [%s](https://github.com/%s/releases/tag/%s). Published to Docker Hub as `%s:%s`, with a best-effort mirror on [GHCR](%s).\n\n' \
-              "$VERSION" "$UP_TAG" "$UPSTREAM" "$UP_TAG" "$IMAGE" "${TAG#v}" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pkgs/container/${GHCR##*/}"
+            printf 'Container image for PostgreSQL %s with pgvector, VectorChord, PostGIS and pg_cron. Published to Docker Hub as `%s:%s`, with a best-effort mirror on [GHCR](%s).\n\n' \
+              "$VERSION" "$IMAGE" "${TAG#v}" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pkgs/container/${GHCR##*/}"
+            printf '| Component | Version |\n| --- | --- |\n'
+            printf '| PostgreSQL | [%s](https://www.postgresql.org/docs/release/%s/) |\n' "$VERSION" "$VERSION"
+            printf '| pgvector | `%s` |\n| VectorChord | [%s](https://github.com/tensorchord/VectorChord/releases/tag/%s) |\n' \
+              "$(pin PGVECTOR_VERSION)" "$(pin VCHORD_VERSION)" "$(pin VCHORD_VERSION)"
+            printf '| PostGIS | `%s` |\n| pg_cron | `%s` |\n\n' "$(pin POSTGIS_VERSION)" "$(pin PG_CRON_VERSION)"
             printf '| Digest | Tag commit | Build run |\n| --- | --- | --- |\n'
             printf "| \`%s\` | %s | [%s](%s/%s/actions/runs/%s) |\n\n" \
               "${DIGEST:-unknown}" "$SHA" "$BUILD_RUN" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$BUILD_RUN"
-            printf 'The notes below are from upstream %s, quoted as published.\n\n---\n\n' "$UP_TAG"
-            cat "$NOTES"
+            printf 'A newer VectorChord needs `ALTER EXTENSION vchord UPDATE;` and a reindex in each database that uses it; see the README.\n'
           } > "$BODY"
 
           # A prerelease upstream version makes a prerelease here, never marked latest.

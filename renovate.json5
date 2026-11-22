@@ -3,43 +3,74 @@
 // A Renovate app PR triggers workflows, so the `build` (with its smoke test) and `lint`
 // checks run on every bump before it can be merged. Merging a bump to master then
 // builds and publishes through build.yml -> publish.yml.
+//
+// What it watches, all in the Dockerfile:
+//   FROM postgres:<17.x>-bookworm@sha256  the dockerfile manager (tag and digest)
+//   ARG UPSTREAM_VERSION                  the same postgres release, grouped with the FROM bump
+//   ARG <apt package>_VERSION             pgdg's apt index (deb datasource)
+//   ARG VCHORD_VERSION                    VectorChord's GitHub releases; the PR fails the build
+//                                         until VCHORD_SHA256 is updated by hand
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['config:recommended'],
   labels: ['dependencies'],
   // No standing Dependency Dashboard issue: pending updates arrive as PRs.
-  dependencyDashboard: { enabled: false },
+  dependencyDashboard: false,
   customManagers: [
     {
-      // The upstream release, pinned by ARG UPSTREAM_VERSION in the Dockerfile.
-      // Pick the source that matches how upstream publishes:
-      //   GitHub releases:  datasource github-releases, depName owner/repo (below)
-      //   git tags only:    datasource github-tags, plus extractVersionTemplate
-      //                     '^v(?<version>.+)$' for a tag prefix
-      //   npm package:      datasource npm, depName the package name
-      //   container image:  datasource docker, depName the image
+      // The PostgreSQL release, pinned by ARG UPSTREAM_VERSION and mirrored in the FROM tag.
       customType: 'regex',
-      description: '__TITLE__ release pinned by ARG UPSTREAM_VERSION',
+      description: 'PostgreSQL release pinned by ARG UPSTREAM_VERSION',
       managerFilePatterns: ['/(^|/)Dockerfile$/'],
       matchStrings: ['ARG UPSTREAM_VERSION=(?<currentValue>\\S+)'],
-      depNameTemplate: '__UPSTREAM__',
+      depNameTemplate: 'postgres',
+      datasourceTemplate: 'docker',
+      versioningTemplate: 'docker',
+    },
+    {
+      // Extension packages from apt.postgresql.org, one `# renovate:` comment per ARG.
+      customType: 'regex',
+      description: 'pgdg extension packages pinned by exact apt version',
+      managerFilePatterns: ['/(^|/)Dockerfile$/'],
+      matchStrings: ['# renovate: datasource=deb depName=(?<depName>\\S+)\\nARG \\w+=(?<currentValue>\\S+)'],
+      datasourceTemplate: 'deb',
+      registryUrlTemplate: 'https://apt.postgresql.org/pub/repos/apt?suite=bookworm-pgdg&components=main&binaryArch=amd64',
+      versioningTemplate: 'deb',
+    },
+    {
+      customType: 'regex',
+      description: 'VectorChord release',
+      managerFilePatterns: ['/(^|/)Dockerfile$/'],
+      matchStrings: ['# renovate: datasource=github-releases depName=(?<depName>\\S+)\\nARG \\w+=(?<currentValue>\\S+)'],
       datasourceTemplate: 'github-releases',
-      extractVersionTemplate: '^v?(?<version>.+)$',
       versioningTemplate: 'semver',
     },
   ],
   packageRules: [
     {
-      matchDepNames: ['__UPSTREAM__'],
-      commitMessageTopic: '__TITLE__',
+      // PostgreSQL MAJOR upgrades need a dump and restore (or pg_upgrade) of the data
+      // directory: an image that jumped to 18 under `latest` would refuse to start on every
+      // existing PG17 cluster. Majors stay a deliberate, separate decision.
+      matchDepNames: ['postgres'],
+      allowedVersions: '/^17\\.\\d+(-bookworm)?$/',
+      groupName: 'PostgreSQL',
       labels: ['dependencies', 'upstream'],
-      // For an upstream that only ships prereleases, also set
-      //   ignoreUnstable: false, allowedVersions: '!/-alpha\\./'
     },
     {
-      // Pin the base image by digest so its fixes (Debian security updates) arrive
-      // as PRs. Merging one republishes the same upstream version as a -r<n>
-      // rebuild. Batched weekly to limit churn.
+      // pgdg builds for a different PG major or Debian release never belong here.
+      matchDatasources: ['deb'],
+      allowedVersions: '/pgdg12\\+\\d+$/',
+      labels: ['dependencies', 'extensions'],
+    },
+    {
+      matchDepNames: ['tensorchord/VectorChord'],
+      commitMessageTopic: 'VectorChord',
+      labels: ['dependencies', 'extensions'],
+      prBodyNotes: ['Update `VCHORD_SHA256` to the digest GitHub lists on the new `postgresql-17-vchord_<version>-1_amd64.deb` asset; the build fails until it matches. After deploying, run `ALTER EXTENSION vchord UPDATE;` and reindex in each database that uses it.'],
+    },
+    {
+      // Base image security rebuilds arrive as digest PRs, batched weekly to limit churn.
+      // Merging one republishes the same PostgreSQL version as a -r<n> rebuild.
       matchDatasources: ['docker'],
       pinDigests: true,
     },
